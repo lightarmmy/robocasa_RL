@@ -21,9 +21,10 @@ def attention_backend():
 
 
 class Server:
-    def __init__(self, model_path, host, port, policy_checkpoint=None):
+    def __init__(self, model_path, host, port, policy_checkpoint=None, device="cuda:0"):
         self.host = host
         self.port = port
+        self.device = torch.device(device)
 
         print("Loading model...")
         self.model = AutoModel.from_pretrained(
@@ -31,7 +32,7 @@ class Server:
             trust_remote_code=True,
             attn_implementation=attention_backend(),
             dtype=torch.bfloat16,
-        ).cuda().to(torch.bfloat16)
+        ).to(device=self.device, dtype=torch.bfloat16)
         if policy_checkpoint:
             print(f"Loading PPO policy checkpoint: {policy_checkpoint}")
             state = torch.load(policy_checkpoint, map_location="cpu", weights_only=False)
@@ -138,6 +139,11 @@ def parse_args():
         default=None,
         help="Optional RLinf full_weights.pt; loads native xr1_model.* weights.",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda:0",
+        help="Torch device in the job-local CUDA namespace.",
+    )
     return parser.parse_args()
 
 
@@ -149,5 +155,6 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         policy_checkpoint=args.policy_checkpoint,
+        device=args.device,
     )
     server.serve()

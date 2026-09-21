@@ -1048,3 +1048,91 @@ MUJOCO_EGL_DEVICE_ID=${lane}
 18/25/25、errors=0。作业结束后必须重新读取三个 `aggregate.json`，核验 50/250 完整
 分母、checkpoint 路径、seed/split/trials，之后才能报告整体成功率和 per-task paired
 fixed-seed 差异。
+
+## 17. v6 的 0% eval 回归、修复与 v7 作业（2026-09-22）
+
+### 17.1 v6 结果无效，0% 不是模型性能
+
+v6 最终暴露了两个独立回归。`108377` 以 `FAILED (1:0)` 结束，只完成 30/50 tasks、
+150/250 episodes；`108378` 和 `108379` 在分别只有 16/50、8/50 个有效 task 时被取消，
+因为已经有 29、34 个 task 连续三次失败，不可能再形成完整 50/250 分母。三组当时的
+success 都是 0，但不得作为模型结果。
+
+旧结果证明 evaluator/model/action 主链路本来可以成功：
+
+- `robocasa365-two-policy-isolated-105135` 完整 50×5 结果分别为 154/250（61.6%）和
+  153/250（61.2%）；
+- 原始模型旧的部分运行 `robocasa365-target50-5trials-single` 为 76/125（60.8%）；
+- `105451` aggregate 本身只有 2/50 tasks，不能报告 100% 总分，但同 seed 的 success
+  视频能用于行为回归。例如 `CloseFridge / seed=12` 中旧 policy 明显运动并成功，v6
+  则跑满 900 steps 仍近乎静止。
+
+视频帧审计进一步定位到 readback：旧 CloseFridge success 视频有 142 帧且 142 个不同
+frame；v6 failure 视频有 451 帧却只有 38 个不同 frame，单个陈旧 frame 最多连续重复
+165 次。策略因此长期收到 stale observation，而不是正常闭环图像。
+
+### 17.2 direct GL hook 的具体错误和修复
+
+v6 将 `direct_gl_readback` 默认打开。旧实现把 `GL_READ_FRAMEBUFFER` /
+`GL_DRAW_FRAMEBUFFER` 绑定到 MuJoCo resolve FBO 后没有恢复，还遗留 read buffer、pack
+alignment 和 pixel-pack-buffer binding。它只在修改 GL binding 后调用原始
+`mjr_readPixels` 做首帧比较，因此两个 reader 可以同时读取同一个错误/stale target，
+`exact_pixel_match=true` 不能证明后续帧正确。相同 context 还可能在每个 episode 被重复
+包装。运行中同时出现 `GLError 1282 glBindFramebuffer` 和 native abort。
+
+修复位于 `eval_robocasa365/entry.py`：
+
+- 正式评测默认和 sbatch 都显式使用 `--no-direct-gl-readback`，恢复旧的 MuJoCo readback；
+- 仍保留 PBO 路径用于诊断，但它现在在任何 GL 修改前取 reference，完整保存并恢复 read/
+  draw FBO、read buffer、pack alignment 和 PBO binding；
+- context 用安装标记防止重复 hook。
+
+原生 MuJoCo readback 的偶发 abort 继续由既有的每 episode worker replacement、native-abort
+queue recovery 和每 task 三次 process-level retry 隔离，不能再用会改变 policy observation
+语义的 readback 替代路径掩盖。
+
+### 17.3 Slurm CUDA/EGL 映射修复
+
+v6 把每条 lane 的 `CUDA_VISIBLE_DEVICES` 缩成 `0`、`1`、`2`、`3`。该集群的 sbatch
+进程已经将物理分配重映射成 job-local `CUDA_VISIBLE_DEVICES=0,1,2,3`；再次在 child 中
+用物理 `SLURM_JOB_GPUS` 或缩窄错误 ordinal 都可能得到 `No CUDA GPUs are available`。
+
+当前脚本保留 Slurm 提供的完整 job-local visibility list。`deploy/server.py` 新增 `--device`
+并显式把四条 lane 放到 `cuda:0..3`；`MUJOCO_EGL_DEVICE_ID` 同样使用 job-local lane，满足
+robosuite 要求该值必须出现在 `CUDA_VISIBLE_DEVICES` 中。脚本仍记录物理
+`SLURM_JOB_GPUS`，便于审计非连续分配，但不再把物理 id 当作 torch ordinal。
+
+### 17.4 测试、gate 和 v7 完整评测
+
+新增 `xr1/tests/test_robocasa365_eval.py`，覆盖 readback 默认关闭、PBO GL 状态恢复、防重复
+hook 和 model server job-local device 选择。完整轻量回归为 `11 passed`，Python compile、
+shell syntax 和 `git diff --check` 均通过。
+
+早期 gate `108492` / `108496` 分别确认了“物理 id 不能作为 child CUDA ordinal”和
+“物理 EGL id 不在 job-local CUDA list”两种错误，均在进入 episode 前失败，不含性能
+结果。当前验收 gate 为：
+
+```text
+108504  pretrained / OpenStandMixerHead / seeds 42--46 / 5 episodes
+         完整 5/5 且 successes >= 1 才返回 success
+```
+
+三组完整 v7 已提交为 `afterok:108504`，gate 不通过就不会启动：
+
+```text
+108506  pretrained -> eval_results/fixedseed-target50-pretrained-5trials-v7-20260922
+108507  step500    -> eval_results/fixedseed-target50-step500-5trials-v7-20260922
+108509  step1000   -> eval_results/fixedseed-target50-step1000-5trials-v7-20260922
+```
+
+`108504` 随后在 `gnho008` 以 `COMPLETED (0:0)` 结束：1/1 task、5/5 episodes、5/5
+success，steps 分别为 98/186/98/121/106，且 summary 明确记录
+`direct_gl_readback=false`。这恢复了旧 evaluator 对同一任务/seeds 的成功行为，排除了
+原始权重真实为 0% 的解释。依赖解除后 `108506` 已在 `gnho008` 启动，四条 lane 的 model
+server 均实际进入运行；物理分配为非连续 `0,1,5,6`，job-local CUDA list 为
+`0,1,2,3`，验证新映射覆盖了此前失败的非连续分配。`108507` / `108509` 当时因 Priority
+等待资源。
+
+正式报告仍必须等待每组
+`completed_tasks=expected_tasks=50`、`episodes=expected_episodes=250`，并检查 job
+exit code、checkpoint、split、seed 和 trials；任何部分 aggregate 或 gate 都不是最终分数。

@@ -24,16 +24,21 @@ eval_split=${EVAL_SPLIT:-pretrain}
 eval_seed=${EVAL_SEED:-7}
 num_trials=${NUM_TRIALS:-5}
 num_lanes=${NUM_LANES:-4}
+min_successes=${EVAL_MIN_SUCCESSES:-0}
 eval_tasks=${EVAL_TASKS:-}
 result_root=${EVAL_RESULT_ROOT:-${repo_root}/eval_results/robocasa365-${policy_name}-${SLURM_JOB_ID}}
 # Multiple evaluation jobs may share one node. Give each Slurm job a disjoint
 # four-port block instead of colliding on the old fixed 12086..12089 range.
 port_base=${EVAL_PORT_BASE:-$((20000 + (SLURM_JOB_ID % 10000) * 4))}
 
-# Slurm's device cgroup remaps an allocated physical subset to job-local CUDA
-# ordinals 0..N-1.  Child processes must select those logical ordinals; using
-# SLURM_JOB_GPUS physical ids here makes CUDA report no available devices.
-slurm_gpu_allocation=${SLURM_JOB_GPUS:-unknown}
+# A batch allocation may contain a non-contiguous physical GPU subset. Keep
+# Slurm's complete CUDA visibility list in every child: narrowing it to a
+# physical id after CUDA has entered the job-local namespace can hide all GPUs.
+# The model server and EGL both select the job-local lane while retaining the
+# full visibility list required by CUDA initialization.
+slurm_gpu_allocation=${SLURM_STEP_GPUS:-${SLURM_JOB_GPUS:-}}
+job_cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-${slurm_gpu_allocation}}
+IFS=',' read -r -a allocated_gpus <<< "${slurm_gpu_allocation}"
 
 if [[ "${policy_checkpoint}" == "none" ]]; then
   policy_checkpoint=
@@ -50,6 +55,20 @@ fi
   echo "NUM_LANES must be a positive integer, got: ${num_lanes}" >&2
   exit 2
 }
+[[ "${min_successes}" =~ ^[0-9]+$ ]] || {
+  echo "EVAL_MIN_SUCCESSES must be a non-negative integer, got: ${min_successes}" >&2
+  exit 2
+}
+if (( ${#allocated_gpus[@]} < num_lanes )); then
+  echo "Slurm allocated fewer GPU ids than NUM_LANES: ${slurm_gpu_allocation:-unset}" >&2
+  exit 2
+fi
+for gpu in "${allocated_gpus[@]:0:num_lanes}"; do
+  [[ "${gpu}" =~ ^[0-9]+$ ]] || {
+    echo "Expected numeric Slurm GPU ids, got: ${slurm_gpu_allocation}" >&2
+    exit 2
+  }
+done
 (( port_base >= 1024 && port_base + num_lanes - 1 <= 65535 )) || {
   echo "Invalid evaluation port range: ${port_base}-$((port_base + num_lanes - 1))" >&2
   exit 2
@@ -64,9 +83,11 @@ export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 echo "job=${SLURM_JOB_ID} host=$(hostname) policy_name=${policy_name}"
 echo "policy_checkpoint=${policy_checkpoint:-PRETRAINED_BASE_MODEL}"
 echo "result_root=${result_root} split=${eval_split} seed=${eval_seed} trials=${num_trials} lanes=${num_lanes}"
+echo "min_successes=${min_successes}"
 echo "port_range=${port_base}-$((port_base + num_lanes - 1))"
 [[ -n "${eval_tasks}" ]] && echo "task_filter=${eval_tasks}"
-echo "slurm_gpu_allocation=${slurm_gpu_allocation}; using logical_gpu_ids=0-$((num_lanes - 1))"
+echo "slurm_gpu_allocation=${slurm_gpu_allocation}; physical_gpu_ids=${allocated_gpus[*]:0:num_lanes}"
+echo "job_cuda_visible_devices=${job_cuda_visible_devices}; model_devices=cuda:0-$((num_lanes - 1))"
 echo "mujoco_gl=${MUJOCO_GL}"
 NUM_LANES="${num_lanes}" "${python}" -c 'import os, torch, transformers; print("torch", torch.__version__, "transformers", transformers.__version__); assert torch.cuda.is_available() and torch.cuda.device_count() >= int(os.environ["NUM_LANES"])'
 
@@ -78,16 +99,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 for lane in $(seq 0 $((num_lanes - 1))); do
-  gpu=${lane}
   lane_log=${result_root}/lanes/lane-${lane}.log
   (
     set -uo pipefail
-    export CUDA_VISIBLE_DEVICES=${gpu}
+    export CUDA_VISIBLE_DEVICES=${job_cuda_visible_devices}
     if [[ "${MUJOCO_GL}" == "egl" ]]; then
-      # robosuite validates that the EGL device id appears literally in
-      # CUDA_VISIBLE_DEVICES. Each lane exposes one job-local Slurm ordinal,
-      # so keep the two variables on the same lane id.
-      export MUJOCO_EGL_DEVICE_ID=${gpu}
+      # Slurm exposes allocated devices as job-local ordinals 0..N-1.
+      export MUJOCO_EGL_DEVICE_ID=${lane}
     else
       unset MUJOCO_EGL_DEVICE_ID
     fi
@@ -122,6 +140,7 @@ PY
           --model "${model_path}"
           --host 127.0.0.1
           --port "${port}"
+          --device "cuda:${lane}"
         )
         if [[ -n "${policy_checkpoint}" ]]; then
           server_args+=(--policy-checkpoint "${policy_checkpoint}")
@@ -146,6 +165,7 @@ PY
             bash scripts/launch_robocasa365.sh \
               1 "${result_root}/results" "${model_path}" \
               --task-name "${task}" --save-videos --save-failure-videos \
+              --no-direct-gl-readback \
               >"${task_log}" 2>&1
           task_status=$?
           set -e
@@ -181,7 +201,7 @@ done
 
 POLICY_NAME="${policy_name}" POLICY_CHECKPOINT="${policy_checkpoint}" \
 EVAL_SPLIT="${eval_split}" EVAL_SEED="${eval_seed}" NUM_TRIALS="${num_trials}" EVAL_STATUS="${status}" \
-EVAL_TASKS="${eval_tasks}" \
+EVAL_TASKS="${eval_tasks}" EVAL_MIN_SUCCESSES="${min_successes}" \
 "${python}" - "${result_root}" <<'PY'
 import json
 import os
@@ -212,6 +232,7 @@ out = {
     "expected_tasks": expected_tasks,
     "episodes": episodes,
     "expected_episodes": expected_tasks * trials,
+    "min_successes": int(os.environ["EVAL_MIN_SUCCESSES"]),
     "successes": successes,
     "success_rate": successes / episodes if episodes else 0.0,
     "task_summaries": rows,
@@ -221,6 +242,10 @@ print(json.dumps({k: out[k] for k in (
     "policy", "completed_tasks", "episodes", "successes", "success_rate"
 )}))
 
-complete = len(rows) == expected_tasks and episodes == expected_tasks * trials
+complete = (
+    len(rows) == expected_tasks
+    and episodes == expected_tasks * trials
+    and successes >= int(os.environ["EVAL_MIN_SUCCESSES"])
+)
 sys.exit(0 if int(os.environ.get("EVAL_STATUS", "1")) == 0 and complete else 1)
 PY

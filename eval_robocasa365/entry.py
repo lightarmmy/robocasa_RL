@@ -241,6 +241,8 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
     context = robosuite_env.sim._render_context_offscreen
     if context is None:
         raise RuntimeError("RoboCasa offscreen render context is not initialized")
+    if getattr(context, "_xr1_direct_gl_readback_installed", False):
+        return
 
     original_read_pixels = context.read_pixels
     validated = [False]
@@ -256,6 +258,14 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
         if depth or segmentation:
             raise RuntimeError("Direct GL readback currently supports RGB observations only")
         self.gl_ctx.make_current()
+        # Validate against the unmodified MuJoCo path before changing any GL
+        # binding. Comparing after binding offFBO_r can make both readers see
+        # the same wrong or stale target and is therefore not a useful gate.
+        reference = None
+        if not validated[0]:
+            reference = original_read_pixels(
+                width, height, depth=depth, segmentation=segmentation
+            )
         # ``mjr_render`` can leave a recoverable GL error flag for complex
         # scenes. PyOpenGL checks the pre-existing flag after its next call and
         # otherwise misattributes it to glBindFramebuffer. MuJoCo's C wrapper
@@ -269,33 +279,39 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
         if stale_errors and not stale_error_reported[0]:
             logging.warning("DIRECT_GL_STALE_ERRORS cleared=%s", stale_errors)
             stale_error_reported[0] = True
-        if self.con.offSamples:
-            # Resolve MuJoCo's multisampled render target before reading it.
-            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
-            GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self.con.offFBO_r)
-            GL.glBlitFramebuffer(
-                0,
-                0,
-                self.con.offWidth,
-                self.con.offHeight,
-                0,
-                0,
-                self.con.offWidth,
-                self.con.offHeight,
-                GL.GL_COLOR_BUFFER_BIT,
-                GL.GL_NEAREST,
-            )
-            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO_r)
-        else:
-            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
-        GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
-        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
-        # Direct client-memory readback reproducibly SIGABRTs in NVIDIA's EGL
-        # path for some long trajectories. Use a pixel-pack buffer so the
-        # driver writes GPU memory first, then copy the completed bytes out.
-        byte_count = width * height * 3
-        pbo = GL.glGenBuffers(1)
+        previous_read_fbo = GL.glGetIntegerv(GL.GL_READ_FRAMEBUFFER_BINDING)
+        previous_draw_fbo = GL.glGetIntegerv(GL.GL_DRAW_FRAMEBUFFER_BINDING)
+        previous_read_buffer = GL.glGetIntegerv(GL.GL_READ_BUFFER)
+        previous_pack_alignment = GL.glGetIntegerv(GL.GL_PACK_ALIGNMENT)
+        previous_pack_buffer = GL.glGetIntegerv(GL.GL_PIXEL_PACK_BUFFER_BINDING)
+        pbo = None
         try:
+            if self.con.offSamples:
+                # Resolve MuJoCo's multisampled render target before reading it.
+                GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
+                GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self.con.offFBO_r)
+                GL.glBlitFramebuffer(
+                    0,
+                    0,
+                    self.con.offWidth,
+                    self.con.offHeight,
+                    0,
+                    0,
+                    self.con.offWidth,
+                    self.con.offHeight,
+                    GL.GL_COLOR_BUFFER_BIT,
+                    GL.GL_NEAREST,
+                )
+                GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO_r)
+            else:
+                GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
+            GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
+            GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+            # Direct client-memory readback reproducibly SIGABRTs in NVIDIA's
+            # EGL path for some long trajectories. Use a pixel-pack buffer so
+            # the driver writes GPU memory first, then copy the bytes out.
+            byte_count = width * height * 3
+            pbo = GL.glGenBuffers(1)
             GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
             GL.glBufferData(
                 GL.GL_PIXEL_PACK_BUFFER, byte_count, None, GL.GL_STREAM_READ
@@ -313,15 +329,17 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
                 GL.GL_PIXEL_PACK_BUFFER, 0, byte_count
             )
         finally:
-            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
-            GL.glDeleteBuffers(1, [pbo])
+            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, previous_pack_buffer)
+            if pbo is not None:
+                GL.glDeleteBuffers(1, [pbo])
+            GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, previous_pack_alignment)
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, previous_read_fbo)
+            GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, previous_draw_fbo)
+            GL.glReadBuffer(previous_read_buffer)
         image = np.ascontiguousarray(
             np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
         )
-        if not validated[0]:
-            reference = original_read_pixels(
-                width, height, depth=depth, segmentation=segmentation
-            )
+        if reference is not None:
             if not np.array_equal(image, reference):
                 difference = np.abs(image.astype(np.int16) - reference.astype(np.int16))
                 raise RuntimeError(
@@ -333,6 +351,7 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
         return image
 
     context.read_pixels = types.MethodType(read_pixels, context)
+    context._xr1_direct_gl_readback_installed = True
     logging.info("DIRECT_GL_READBACK enabled=true")
 
 
@@ -490,7 +509,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video-stride", type=int, default=2)
     parser.add_argument("--video-fps", type=int, default=20)
     parser.add_argument("--camera-sampling-interval", type=int, default=1)
-    parser.add_argument("--direct-gl-readback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--direct-gl-readback", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args(argv)
 
 
