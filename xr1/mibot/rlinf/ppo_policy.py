@@ -63,6 +63,7 @@ class XR1PPOPolicy(nn.Module, BasePolicy):
     # the HuggingFace processor/model as regular multimodal inputs.
     _DIAGNOSTIC_FIELDS = {
         "xr1_rollout_mean", "xr1_rollout_logprobs", "xr1_trace_probes",
+        "xr1_text_pad_token_id",
     }
 
     def __init__(
@@ -123,6 +124,13 @@ class XR1PPOPolicy(nn.Module, BasePolicy):
             if add_value_head
             else None
         )
+        if self.value_head is not None:
+            # With sparse binary task rewards, a random value head creates
+            # non-zero GAE targets before the policy has observed any reward.
+            # Zero initialization keeps both actor and critic signals at zero
+            # until rollout data contains an actual learning signal.
+            nn.init.zeros_(self.value_head.weight)
+            nn.init.zeros_(self.value_head.bias)
         self.set_trainable_mode(trainable_mode)
 
     @property
@@ -599,6 +607,20 @@ class XR1PPOPolicy(nn.Module, BasePolicy):
             key: value for key, value in batch.items() if isinstance(value, torch.Tensor)
         }
         forward_inputs.update({"action": sampled, "xr1_noise": noise})
+        tokenizer = getattr(getattr(self.obs_to_batch, "processor", None), "tokenizer", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if self.obs_to_batch is not None:
+            if pad_token_id is None:
+                raise ValueError("XR-1 tokenizer must define pad_token_id")
+            # The trajectory builder uses this rollout-only field to dynamically
+            # right-pad variable task prompts to the longest prompt in this
+            # rollout.  It is filtered before every model invocation.
+            forward_inputs["xr1_text_pad_token_id"] = torch.full(
+                (sampled.shape[0],),
+                int(pad_token_id),
+                dtype=torch.long,
+                device=sampled.device,
+            )
         # Keep the exact no-grad generation result for a direct consistency
         # check in the actor update.  These fields are filtered before model
         # invocation and are split/flattened by RLinf like other tensors.

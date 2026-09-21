@@ -40,6 +40,12 @@ export PYOPENGL_PLATFORM=${XR1_PYOPENGL_PLATFORM:-${PYOPENGL_PLATFORM:-${MUJOCO_
 export RLINF_ROBOCASA_START_METHOD=${RLINF_ROBOCASA_START_METHOD:-spawn}
 export RLINF_ROBOCASA_SHARE_MEMORY=${RLINF_ROBOCASA_SHARE_MEMORY:-1}
 export RLINF_ROBOCASA_MAX_RESTARTS=${RLINF_ROBOCASA_MAX_RESTARTS:-8}
+# A lost native-simulator transition cannot be reconstructed. Full training
+# therefore fails with the real child exit status instead of silently joining
+# pre-crash and post-reset states. `restart` is reserved for fault-injection
+# tests and diagnostics where invalid transitions are explicitly inspected.
+export RLINF_ROBOCASA_EOF_POLICY=${RLINF_ROBOCASA_EOF_POLICY:-raise}
+export RLINF_ROBOCASA_RECONFIGURE_RESTART=${RLINF_ROBOCASA_RECONFIGURE_RESTART:-1}
 export TOKENIZERS_PARALLELISM=false
 
 cd "${rlinf_root}"
@@ -65,6 +71,8 @@ cmd=(
 [[ -n "${XR1_RLINF_SEED:-}" ]] && cmd+=("env.train.seed=${XR1_RLINF_SEED}")
 [[ -n "${XR1_RLINF_AUTO_RESET:-}" ]] && cmd+=("env.train.auto_reset=${XR1_RLINF_AUTO_RESET}")
 [[ -n "${XR1_RLINF_ROTATE_AUTO_RESET:-}" ]] && cmd+=("env.train.rotate_tasks_on_auto_reset=${XR1_RLINF_ROTATE_AUTO_RESET}")
+[[ -n "${XR1_RLINF_ROTATE_ROLLOUT:-}" ]] && cmd+=("env.train.rotate_tasks_on_rollout=${XR1_RLINF_ROTATE_ROLLOUT}")
+[[ -n "${XR1_RLINF_EPISODE_HORIZON_SOURCE:-}" ]] && cmd+=("env.train.episode_horizon_source=${XR1_RLINF_EPISODE_HORIZON_SOURCE}")
 [[ -n "${XR1_RLINF_USE_REL_REWARD:-}" ]] && cmd+=("env.train.use_rel_reward=${XR1_RLINF_USE_REL_REWARD}")
 [[ -n "${XR1_RLINF_MICRO_BATCH:-}" ]] && cmd+=("actor.micro_batch_size=${XR1_RLINF_MICRO_BATCH}")
 [[ -n "${XR1_RLINF_GLOBAL_BATCH:-}" ]] && cmd+=("actor.global_batch_size=${XR1_RLINF_GLOBAL_BATCH}")

@@ -61,7 +61,7 @@ def initialize_queue(queue_dir: Path, evaluation_args: list[str]) -> None:
         args.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     queue_dir.mkdir(parents=True, exist_ok=False)
-    for directory in ("pending", "running", "results", "errors", "logs"):
+    for directory in ("pending", "running", "results", "errors", "logs", "attempts"):
         (queue_dir / directory).mkdir()
 
     jobs = []
@@ -106,6 +106,52 @@ def claim_job(queue_dir: Path, worker_id: str) -> tuple[Path, dict[str, Any]] | 
             continue
         return running_path, read_json(running_path)
     return None
+
+
+def recover_aborted_jobs(queue_dir: Path, worker_id: str, max_attempts: int) -> int:
+    """Return jobs stranded by a native worker abort to the pending queue.
+
+    SIGABRT cannot be caught by Python, so the claimed JSON remains in
+    ``running``.  The supervising shell invokes this after a non-zero worker
+    exit. Attempts are tracked separately so the canonical job manifest and
+    result validation remain unchanged.
+    """
+    recovered = 0
+    exhausted = 0
+    for running_path in sorted((queue_dir / "running").glob(f"*.{worker_id}.json")):
+        job = read_json(running_path)
+        job_id = job["id"]
+        attempt_path = queue_dir / "attempts" / f"{job_id}.json"
+        attempt = int(read_json(attempt_path)["attempt"]) + 1 if attempt_path.exists() else 1
+        write_json_atomic(attempt_path, {"attempt": attempt, "worker_id": worker_id})
+        if attempt < max_attempts:
+            pending_path = queue_dir / "pending" / f"{job_id}.json"
+            os.replace(running_path, pending_path)
+            logging.warning(
+                "Recovered rollout %s from aborted worker %s (attempt %d/%d)",
+                job_id, worker_id, attempt, max_attempts,
+            )
+            recovered += 1
+        else:
+            write_json_atomic(
+                queue_dir / "errors" / f"{job_id}.native-abort.json",
+                {
+                    "job": job,
+                    "worker_id": worker_id,
+                    "error": "native worker abort retry limit exhausted",
+                    "attempts": attempt,
+                },
+            )
+            running_path.unlink(missing_ok=True)
+            logging.error(
+                "Rollout %s exhausted native-abort retry limit (%d)",
+                job_id, max_attempts,
+            )
+            exhausted += 1
+    if recovered == 0 and exhausted == 0:
+        logging.error("No stranded job found for aborted worker %s", worker_id)
+        return 2
+    return 1 if exhausted else 0
 
 
 def run_worker(
@@ -323,6 +369,10 @@ def parse_args() -> argparse.Namespace:
 
     merge_parser = subparsers.add_parser("merge", help="Validate and merge rollout results.")
     merge_parser.add_argument("--queue-dir", type=Path, required=True)
+    recover_parser = subparsers.add_parser("recover", help="Recover jobs stranded by a native worker abort.")
+    recover_parser.add_argument("--queue-dir", type=Path, required=True)
+    recover_parser.add_argument("--worker-id", required=True)
+    recover_parser.add_argument("--max-attempts", type=int, default=3)
     return parser.parse_args()
 
 
@@ -335,8 +385,12 @@ def main() -> None:
         if args.max_jobs is not None and args.max_jobs < 1:
             raise ValueError("--max-jobs must be at least one")
         run_worker(args.queue_dir, args.worker_id, args.server_addr, args.server_port, args.max_jobs)
-    else:
+    elif args.command == "merge":
         merge_results(args.queue_dir)
+    else:
+        if args.max_attempts < 1:
+            raise ValueError("--max-attempts must be at least one")
+        raise SystemExit(recover_aborted_jobs(args.queue_dir, args.worker_id, args.max_attempts))
 
 
 if __name__ == "__main__":

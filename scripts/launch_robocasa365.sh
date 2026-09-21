@@ -47,6 +47,7 @@ OBS_HISTORY="${OBS_HISTORY:-4}"
 OBS_INTERVAL="${OBS_INTERVAL:-2}"
 SEED="${SEED:-7}"
 CROP_RATIO="${CROP_RATIO:-0.95}"
+CAMERA_SAMPLING_INTERVAL="${CAMERA_SAMPLING_INTERVAL:-1}"
 
 "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" init \
     --queue-dir "${QUEUE_DIR}" -- \
@@ -61,6 +62,7 @@ CROP_RATIO="${CROP_RATIO:-0.95}"
     --obs-interval "${OBS_INTERVAL}" \
     --seed "${SEED}" \
     --crop-ratio "${CROP_RATIO}" \
+    --camera-sampling-interval "${CAMERA_SAMPLING_INTERVAL}" \
     --save-root-dir "${LOG_PATH}" \
     --run-id "${RUN_ID}"
 
@@ -76,8 +78,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 WORKER_MAX_JOBS="${WORKER_MAX_JOBS:-1}"
+WORKER_MAX_ATTEMPTS="${WORKER_MAX_ATTEMPTS:-3}"
 if ! [[ "${WORKER_MAX_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "WORKER_MAX_JOBS must be a positive integer, got: ${WORKER_MAX_JOBS}" >&2
+    exit 1
+fi
+if ! [[ "${WORKER_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "WORKER_MAX_ATTEMPTS must be a positive integer, got: ${WORKER_MAX_ATTEMPTS}" >&2
     exit 1
 fi
 
@@ -95,12 +102,26 @@ for ((index = 0; index < NUM_PORTS; index++)); do
         # in read_pixels.  Restart the Python worker after a bounded number of
         # episodes, which resets native OpenGL/MuJoCo global state as well.
         while compgen -G "${QUEUE_DIR}/pending/*.json" > /dev/null; do
-            env "${worker_env[@]}" "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" worker \
+            worker_command=(
+                "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" worker
+                --queue-dir "${QUEUE_DIR}"
+                --worker-id "gpu-${index}"
+                --server-addr "${SERVER_ADDR}"
+                --server-port "${port}"
+                --max-jobs "${WORKER_MAX_JOBS}"
+            )
+            if env "${worker_env[@]}" "${worker_command[@]}"; then
+                continue
+            else
+                worker_status=$?
+            fi
+            echo "Worker gpu-${index} exited with status ${worker_status}; recovering stranded rollout" >&2
+            if ! "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" recover \
                 --queue-dir "${QUEUE_DIR}" \
                 --worker-id "gpu-${index}" \
-                --server-addr "${SERVER_ADDR}" \
-                --server-port "${port}" \
-                --max-jobs "${WORKER_MAX_JOBS}" || exit $?
+                --max-attempts "${WORKER_MAX_ATTEMPTS}"; then
+                exit "${worker_status}"
+            fi
         done
     ) >"${QUEUE_DIR}/logs/worker-${index}.log" 2>&1 &
     worker_pids+=("$!")

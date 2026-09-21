@@ -2,6 +2,7 @@ import torch
 from types import SimpleNamespace
 
 from mibot.rlinf.ppo_policy import XR1PPOPolicy
+from rlinf.data.schema.embodied_trajectory_builder import EmbodiedTrajectoryBuilder
 
 
 class DummyXR1(torch.nn.Module):
@@ -22,6 +23,8 @@ class DummyXR1(torch.nn.Module):
 
 def test_modes_and_ppo_contract():
     policy = XR1PPOPolicy(DummyXR1(), action_dim=4, action_horizon=2)
+    assert torch.count_nonzero(policy.value_head.weight) == 0
+    assert torch.count_nonzero(policy.value_head.bias) == 0
     policy.set_trainable_mode("action_expert")
     assert not policy.xr1_model.vlm.weight.requires_grad
     assert policy.xr1_model.dit.weight.requires_grad
@@ -92,3 +95,22 @@ def test_probability_flow_logprob_reuses_rollout_probes_and_backpropagates():
     (-updated["logprobs"].sum() + updated["values"].sum()).backward()
     assert policy.xr1_model.velocity_scale.grad is not None
     assert torch.isfinite(policy.xr1_model.velocity_scale.grad)
+
+
+def test_xr1_trajectory_dynamically_pads_different_task_prompts():
+    builder = EmbodiedTrajectoryBuilder()
+    builder.forward_inputs = [{
+        "input_ids": torch.arange(476).reshape(1, 476),
+        "attention_mask": torch.ones(1, 476, dtype=torch.long),
+        "xr1_text_pad_token_id": torch.tensor([151643]),
+    }, {
+        "input_ids": torch.arange(486).reshape(1, 486),
+        "attention_mask": torch.ones(1, 486, dtype=torch.long),
+        "xr1_text_pad_token_id": torch.tensor([151643]),
+    }]
+    stacked = builder.to_trajectory().forward_inputs
+    assert stacked["input_ids"].shape == (2, 1, 486)
+    assert stacked["attention_mask"].shape == (2, 1, 486)
+    assert torch.all(stacked["input_ids"][0, :, 476:] == 151643)
+    assert torch.count_nonzero(stacked["attention_mask"][0, :, 476:]) == 0
+    assert torch.count_nonzero(stacked["attention_mask"][1]) == 486

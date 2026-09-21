@@ -21,20 +21,27 @@ model_path=${repo_root}/checkpoints/Xiaomi-Robotics-1-RoboCasa365
 policy_checkpoint=${POLICY_CHECKPOINT:-${repo_root}/results/xr1_ppo_full_stable_100u_resume/xr1_robocasa365_ppo_full/checkpoints/global_step_100/actor/model_state_dict/full_weights.pt}
 policy_name=${POLICY_NAME:-full_step100}
 eval_split=${EVAL_SPLIT:-pretrain}
+eval_seed=${EVAL_SEED:-7}
 num_trials=${NUM_TRIALS:-5}
 num_lanes=${NUM_LANES:-4}
 eval_tasks=${EVAL_TASKS:-}
 result_root=${EVAL_RESULT_ROOT:-${repo_root}/eval_results/robocasa365-${policy_name}-${SLURM_JOB_ID}}
+# Multiple evaluation jobs may share one node. Give each Slurm job a disjoint
+# four-port block instead of colliding on the old fixed 12086..12089 range.
+port_base=${EVAL_PORT_BASE:-$((20000 + (SLURM_JOB_ID % 10000) * 4))}
 
 # Slurm's device cgroup remaps an allocated physical subset to job-local CUDA
 # ordinals 0..N-1.  Child processes must select those logical ordinals; using
 # SLURM_JOB_GPUS physical ids here makes CUDA report no available devices.
 slurm_gpu_allocation=${SLURM_JOB_GPUS:-unknown}
 
-[[ -f "${policy_checkpoint}" ]] || {
+if [[ "${policy_checkpoint}" == "none" ]]; then
+  policy_checkpoint=
+fi
+if [[ -n "${policy_checkpoint}" && ! -f "${policy_checkpoint}" ]]; then
   echo "Missing PPO policy checkpoint: ${policy_checkpoint}" >&2
   exit 2
-}
+fi
 [[ "${num_trials}" =~ ^[1-9][0-9]*$ ]] || {
   echo "NUM_TRIALS must be a positive integer, got: ${num_trials}" >&2
   exit 2
@@ -43,18 +50,24 @@ slurm_gpu_allocation=${SLURM_JOB_GPUS:-unknown}
   echo "NUM_LANES must be a positive integer, got: ${num_lanes}" >&2
   exit 2
 }
+(( port_base >= 1024 && port_base + num_lanes - 1 <= 65535 )) || {
+  echo "Invalid evaluation port range: ${port_base}-$((port_base + num_lanes - 1))" >&2
+  exit 2
+}
 
 mkdir -p "${result_root}/lanes" "${result_root}/results"
 cd "${repo_root}"
-export MUJOCO_GL=egl TOKENIZERS_PARALLELISM=false USE_TF=0 USE_TORCH=1
+export MUJOCO_GL=${MUJOCO_GL:-egl} TOKENIZERS_PARALLELISM=false USE_TF=0 USE_TORCH=1
 export HF_HOME=${repo_root}/.hf_cache OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 
 echo "job=${SLURM_JOB_ID} host=$(hostname) policy_name=${policy_name}"
-echo "policy_checkpoint=${policy_checkpoint}"
-echo "result_root=${result_root} split=${eval_split} trials=${num_trials} lanes=${num_lanes}"
+echo "policy_checkpoint=${policy_checkpoint:-PRETRAINED_BASE_MODEL}"
+echo "result_root=${result_root} split=${eval_split} seed=${eval_seed} trials=${num_trials} lanes=${num_lanes}"
+echo "port_range=${port_base}-$((port_base + num_lanes - 1))"
 [[ -n "${eval_tasks}" ]] && echo "task_filter=${eval_tasks}"
 echo "slurm_gpu_allocation=${slurm_gpu_allocation}; using logical_gpu_ids=0-$((num_lanes - 1))"
+echo "mujoco_gl=${MUJOCO_GL}"
 NUM_LANES="${num_lanes}" "${python}" -c 'import os, torch, transformers; print("torch", torch.__version__, "transformers", transformers.__version__); assert torch.cuda.is_available() and torch.cuda.device_count() >= int(os.environ["NUM_LANES"])'
 
 lane_pids=()
@@ -69,7 +82,15 @@ for lane in $(seq 0 $((num_lanes - 1))); do
   lane_log=${result_root}/lanes/lane-${lane}.log
   (
     set -uo pipefail
-    export CUDA_VISIBLE_DEVICES=${gpu} MUJOCO_EGL_DEVICE_ID=${gpu}
+    export CUDA_VISIBLE_DEVICES=${gpu}
+    if [[ "${MUJOCO_GL}" == "egl" ]]; then
+      # robosuite validates that the EGL device id appears literally in
+      # CUDA_VISIBLE_DEVICES. Each lane exposes one job-local Slurm ordinal,
+      # so keep the two variables on the same lane id.
+      export MUJOCO_EGL_DEVICE_ID=${gpu}
+    else
+      unset MUJOCO_EGL_DEVICE_ID
+    fi
     mapfile -t tasks < <(SLURM_LANE="${lane}" NUM_LANES="${num_lanes}" EVAL_TASKS="${eval_tasks}" "${python}" - <<'PY' | sed -n 's/^TASK:://p'
 import os
 from robocasa.utils.dataset_registry import TASK_SET_REGISTRY
@@ -92,16 +113,20 @@ PY
     for task in "${tasks[@]}"; do
       task_done=0
       for attempt in 1 2 3; do
-        port=$((12086 + lane))
+        port=$((port_base + lane))
         task_run=target50-${num_trials}trials-${policy_name}-${SLURM_JOB_ID}-lane${lane}-${task}-attempt${attempt}
         task_log=${result_root}/lanes/${task_run}.log
         server_log=${result_root}/lanes/${task_run}-server.log
 
-        "${python}" -u deploy/server.py \
-          --model "${model_path}" \
-          --policy-checkpoint "${policy_checkpoint}" \
-          --host 127.0.0.1 \
-          --port "${port}" >"${server_log}" 2>&1 &
+        server_args=(
+          --model "${model_path}"
+          --host 127.0.0.1
+          --port "${port}"
+        )
+        if [[ -n "${policy_checkpoint}" ]]; then
+          server_args+=(--policy-checkpoint "${policy_checkpoint}")
+        fi
+        "${python}" -u deploy/server.py "${server_args[@]}" >"${server_log}" 2>&1 &
         server_pid=$!
         ready=0
         for _ in $(seq 1 180); do
@@ -116,7 +141,7 @@ PY
         task_status=1
         if (( ready )); then
           set +e
-          BASE_PORT=${port} NUM_TRIALS=${num_trials} SPLIT=${eval_split} \
+          BASE_PORT=${port} NUM_TRIALS=${num_trials} SPLIT=${eval_split} SEED=${eval_seed} \
             RUN_ID="${task_run}" PYTHON="${python}" \
             bash scripts/launch_robocasa365.sh \
               1 "${result_root}/results" "${model_path}" \
@@ -155,7 +180,7 @@ for pid in "${lane_pids[@]}"; do
 done
 
 POLICY_NAME="${policy_name}" POLICY_CHECKPOINT="${policy_checkpoint}" \
-EVAL_SPLIT="${eval_split}" NUM_TRIALS="${num_trials}" EVAL_STATUS="${status}" \
+EVAL_SPLIT="${eval_split}" EVAL_SEED="${eval_seed}" NUM_TRIALS="${num_trials}" EVAL_STATUS="${status}" \
 EVAL_TASKS="${eval_tasks}" \
 "${python}" - "${result_root}" <<'PY'
 import json
@@ -179,8 +204,10 @@ requested = [name for name in os.environ.get("EVAL_TASKS", "").split(",") if nam
 expected_tasks = len(requested) if requested else 50
 out = {
     "policy": os.environ["POLICY_NAME"],
-    "policy_checkpoint": os.environ["POLICY_CHECKPOINT"],
+    "policy_checkpoint": os.environ["POLICY_CHECKPOINT"] or None,
     "split": os.environ["EVAL_SPLIT"],
+    "seed": int(os.environ["EVAL_SEED"]),
+    "num_trials_per_task": trials,
     "completed_tasks": len(rows),
     "expected_tasks": expected_tasks,
     "episodes": episodes,

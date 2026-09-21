@@ -66,11 +66,19 @@ env:
     split: target
     task_soup: target50
     task_mode: null
-    task_sampling_strategy: random
+    # Ordered episode-level rotation makes task coverage deterministic. Never
+    # rotate at rollout boundaries: that would cut 3000-step sparse-reward
+    # episodes into 64-step fragments.
+    task_sampling_strategy: ordered
     rotate_tasks_on_rollout: false
     auto_reset: true
-    rotate_tasks_on_auto_reset: false
-    max_episode_steps: ${oc.decode:${oc.env:XR1_RLINF_EPISODE_STEPS,64}}
+    rotate_tasks_on_auto_reset: true
+    # The old renderer died after roughly 800 simulator steps. End the training
+    # episode at a chunk-aligned 768 steps and replace the whole simulator
+    # process at the task boundary. Standalone evaluation still uses each
+    # benchmark task's official horizon.
+    episode_horizon_source: max_episode_steps
+    max_episode_steps: ${oc.decode:${oc.env:XR1_RLINF_EPISODE_STEPS,768}}
     max_steps_per_rollout_epoch: ${oc.decode:${oc.env:XR1_RLINF_ROLLOUT_STEPS,64}}
     group_size: 1
     reward_coef: 1.0
@@ -88,9 +96,9 @@ env:
     auto_reset: false
     ignore_terminations: false
     use_fixed_reset_state_ids: true
-    episode_horizon_source: max_episode_steps
-    max_episode_steps: ${env.train.max_episode_steps}
-    max_steps_per_rollout_epoch: ${env.train.max_steps_per_rollout_epoch}
+    episode_horizon_source: task_horizon
+    max_episode_steps: 3008
+    max_steps_per_rollout_epoch: 3008
     group_size: 1
     is_eval: true
     video_cfg:

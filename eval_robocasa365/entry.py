@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
 import json
 import logging
 import sys
+import types
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -170,6 +172,170 @@ def reset_env(env: Any, seed: int) -> tuple[dict[str, Any], dict[str, Any]]:
         raise RuntimeError("This evaluator requires a RoboCasa version whose reset() accepts a seed.") from error
 
 
+def configure_camera_sampling_interval(env: Any, interval: int) -> None:
+    """Reduce redundant camera readbacks without changing simulation stepping.
+
+    XR-1 consumes observations spaced by ``obs_interval=2``. Camera sensors
+    are therefore updated on exactly those even-numbered control steps while
+    returning their cached value on unused odd steps.
+    State observables, the control rate, success checks, and task horizon are
+    unchanged.
+    """
+    if interval == 1:
+        return
+    base_env = env.unwrapped
+    robosuite_env = getattr(base_env, "env", base_env)
+    camera_observables = {
+        name: observable
+        for name, observable in robosuite_env._observables.items()
+        if name.endswith(("_image", "_depth", "_segmentation"))
+    }
+    if not camera_observables:
+        raise RuntimeError("No camera observables found in RoboCasa environment")
+    for observable in camera_observables.values():
+        original_update = observable.update
+        last_sampled_step = [None]
+
+        def update_on_consumed_steps(
+            timestep: float,
+            obs_cache: dict[str, Any],
+            force: bool = False,
+            *,
+            _original_update: Any = original_update,
+            _last_sampled_step: list[int | None] = last_sampled_step,
+        ) -> None:
+            control_step = robosuite_env.timestep
+            if force:
+                _original_update(timestep=timestep, obs_cache=obs_cache, force=True)
+                _last_sampled_step[0] = control_step
+            elif control_step % interval == 0 and _last_sampled_step[0] != control_step:
+                # robosuite calls Observable.update once per MuJoCo substep.
+                # Render only on the first substep, matching the timestamp of
+                # the original control-rate camera observable.
+                _original_update(timestep=timestep, obs_cache=obs_cache, force=True)
+                _last_sampled_step[0] = control_step
+
+        observable.update = update_on_consumed_steps
+    logging.info(
+        "CAMERA_SAMPLING interval=%d observables=%s",
+        interval,
+        ",".join(camera_observables),
+    )
+
+
+def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
+    """Read the rendered RGB framebuffer without MuJoCo's aborting wrapper.
+
+    MuJoCo 3.3.1's ``mjr_readPixels`` terminates the process with SIGABRT on
+    this cluster after a deterministic long RoboCasa episode.  The scene was
+    already rendered by ``mjr_render``; OpenGL's readback returns the same RGB
+    framebuffer while reporting a Python exception instead of killing the
+    worker if the driver rejects a call.
+    """
+    if not enabled:
+        return
+    from OpenGL import GL
+
+    base_env = env.unwrapped
+    robosuite_env = getattr(base_env, "env", base_env)
+    context = robosuite_env.sim._render_context_offscreen
+    if context is None:
+        raise RuntimeError("RoboCasa offscreen render context is not initialized")
+
+    original_read_pixels = context.read_pixels
+    validated = [False]
+    stale_error_reported = [False]
+
+    def read_pixels(
+        self: Any,
+        width: int,
+        height: int,
+        depth: bool = False,
+        segmentation: bool = False,
+    ) -> np.ndarray:
+        if depth or segmentation:
+            raise RuntimeError("Direct GL readback currently supports RGB observations only")
+        self.gl_ctx.make_current()
+        # ``mjr_render`` can leave a recoverable GL error flag for complex
+        # scenes. PyOpenGL checks the pre-existing flag after its next call and
+        # otherwise misattributes it to glBindFramebuffer. MuJoCo's C wrapper
+        # does not perform that Python-side check, so clear and record it here.
+        stale_errors = []
+        while True:
+            error = GL.glGetError()
+            if error == GL.GL_NO_ERROR:
+                break
+            stale_errors.append(int(error))
+        if stale_errors and not stale_error_reported[0]:
+            logging.warning("DIRECT_GL_STALE_ERRORS cleared=%s", stale_errors)
+            stale_error_reported[0] = True
+        if self.con.offSamples:
+            # Resolve MuJoCo's multisampled render target before reading it.
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
+            GL.glBindFramebuffer(GL.GL_DRAW_FRAMEBUFFER, self.con.offFBO_r)
+            GL.glBlitFramebuffer(
+                0,
+                0,
+                self.con.offWidth,
+                self.con.offHeight,
+                0,
+                0,
+                self.con.offWidth,
+                self.con.offHeight,
+                GL.GL_COLOR_BUFFER_BIT,
+                GL.GL_NEAREST,
+            )
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO_r)
+        else:
+            GL.glBindFramebuffer(GL.GL_READ_FRAMEBUFFER, self.con.offFBO)
+        GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+        # Direct client-memory readback reproducibly SIGABRTs in NVIDIA's EGL
+        # path for some long trajectories. Use a pixel-pack buffer so the
+        # driver writes GPU memory first, then copy the completed bytes out.
+        byte_count = width * height * 3
+        pbo = GL.glGenBuffers(1)
+        try:
+            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, pbo)
+            GL.glBufferData(
+                GL.GL_PIXEL_PACK_BUFFER, byte_count, None, GL.GL_STREAM_READ
+            )
+            GL.glReadPixels(
+                0,
+                0,
+                width,
+                height,
+                GL.GL_RGB,
+                GL.GL_UNSIGNED_BYTE,
+                ctypes.c_void_p(0),
+            )
+            pixels = GL.glGetBufferSubData(
+                GL.GL_PIXEL_PACK_BUFFER, 0, byte_count
+            )
+        finally:
+            GL.glBindBuffer(GL.GL_PIXEL_PACK_BUFFER, 0)
+            GL.glDeleteBuffers(1, [pbo])
+        image = np.ascontiguousarray(
+            np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 3)
+        )
+        if not validated[0]:
+            reference = original_read_pixels(
+                width, height, depth=depth, segmentation=segmentation
+            )
+            if not np.array_equal(image, reference):
+                difference = np.abs(image.astype(np.int16) - reference.astype(np.int16))
+                raise RuntimeError(
+                    "Direct GL readback differs from MuJoCo reference: "
+                    f"max_abs_diff={difference.max()}, mean_abs_diff={difference.mean()}"
+                )
+            logging.info("DIRECT_GL_READBACK_VALIDATED exact_pixel_match=true")
+            validated[0] = True
+        return image
+
+    context.read_pixels = types.MethodType(read_pixels, context)
+    logging.info("DIRECT_GL_READBACK enabled=true")
+
+
 def evaluate_task(
     env_name: str,
     task_index: int,
@@ -206,6 +372,7 @@ def evaluate_task(
     }
 
     try:
+        configure_camera_sampling_interval(env, args.camera_sampling_interval)
         for episode in tqdm(episodes, desc=env_name, disable=not show_progress):
             global_episode_index = task_index * args.num_trials + episode
             episode_seed = args.seed + global_episode_index
@@ -214,6 +381,9 @@ def evaluate_task(
                 env_name, episode, global_episode_index, episode_seed, horizon,
             )
             observation, _ = reset_env(env, episode_seed)
+            # RoboCasa reset can replace the native offscreen render context,
+            # so install the readback hook only after reset has completed.
+            configure_direct_gl_readback(env, args.direct_gl_readback)
             logging.info("ENV_RESET task=%s episode=%d", env_name, episode)
             instruction = observation["annotation.human.task_description"]
 
@@ -319,6 +489,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-failure-videos", action="store_true")
     parser.add_argument("--video-stride", type=int, default=2)
     parser.add_argument("--video-fps", type=int, default=20)
+    parser.add_argument("--camera-sampling-interval", type=int, default=1)
+    parser.add_argument("--direct-gl-readback", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args(argv)
 
 
@@ -335,6 +507,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--crop-ratio must be in (0, 1]")
     if args.video_stride < 1:
         raise ValueError("--video-stride must be at least 1")
+    if args.camera_sampling_interval < 1:
+        raise ValueError("--camera-sampling-interval must be at least one")
+    if args.camera_sampling_interval not in (1, args.obs_interval):
+        raise ValueError("--camera-sampling-interval must be 1 or match --obs-interval")
 
 
 def select_tasks(args: argparse.Namespace, task_set_registry: dict[str, Any]) -> tuple[dict[str, int], list[str]]:
@@ -371,6 +547,8 @@ def build_summary(args: argparse.Namespace, task_stats: dict[str, dict[str, Any]
         "replan_steps": args.replan_steps,
         "obs_history": args.obs_history,
         "obs_interval": args.obs_interval,
+        "camera_sampling_interval": args.camera_sampling_interval,
+        "direct_gl_readback": args.direct_gl_readback,
         "tasks": task_stats,
     }
 
