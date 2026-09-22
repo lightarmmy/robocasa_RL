@@ -1,9 +1,10 @@
-# XR-1 + RLinf PPO：交接与实验状态（2026-09-18）
+# XR-1 + RLinf PPO：交接与实验状态（更新于 2026-09-22）
 
 这份文档是给新对话/新维护者的快速入口。它记录当前代码实际实现的
 XR-1 RoboCasa365 PPO 框架、已验证/未验证的结论、结果位置与后续实验准则。
-不要把“作业正常结束”误解成“性能已提升”：当前长跑尚在进行，最终只能以
-完整的独立评测和训练曲线判断。
+不要把“作业正常结束”误解成“性能已提升”。1000-update 训练已完成，
+预训练和 step500 的 fixed-seed target50 评测已得到完整分母，step1000 尚差
+20 tasks / 100 episodes。以第 18 节为当前状态的权威入口，早期章节保留作为历史记录。
 
 ## 0. 项目背景与本分支范围
 
@@ -39,13 +40,13 @@ PPO 实验的起点；不是从随机初始化训练。
   估计，不是连续 ODE 的精确解析 likelihood。
 - 单任务 smoke 的 KL/clip/EV 仅是链路健康指标，不是全任务泛化能力证据。
 
-### 进行中的主实验
+### 历史主实验（已完成）
 
 | 项目 | 值 |
 | --- | --- |
 | Slurm job | `106535` (`xr1-flow-target50-1k-r256`) |
 | 目标 | 纯 PPO 在 XR-1 + RoboCasa365 `target50` 的能力边界 |
-| 状态（最近更新时） | `RUNNING`，节点 `gnho020` |
+| 状态 | `COMPLETED (0:0)`，但该旧实验已被后续的 `107949` 取代；见第 15、18 节 |
 | 更新数 | 1000 (`runner.max_steps`，即 1000 次 PPO update；不是 1000 个 action/episode) |
 | 任务 | 所有 `target50`，随机采样，无 task filter |
 | 策略训练范围 | full model + value head |
@@ -1136,3 +1137,111 @@ server 均实际进入运行；物理分配为非连续 `0,1,5,6`，job-local CU
 正式报告仍必须等待每组
 `completed_tasks=expected_tasks=50`、`episodes=expected_episodes=250`，并检查 job
 exit code、checkpoint、split、seed 和 trials；任何部分 aggregate 或 gate 都不是最终分数。
+
+## 18. 2026-09-22 进度快照、恢复边界与异地复刻清单
+
+### 18.1 训练已完成
+
+当前正式训练是 Slurm job `107949`，而不是第 1 节的旧 job。`sacct -X`
+记录为 `COMPLETED (0:0)`，在 `gnho008` 运行了 `04:43:04`（2026-09-21
+01:05:10--05:48:14）。日志到达 `Global Step: 1000/1000`，产物位于：
+
+```text
+results/xr1_ppo_flow_target50_full_1000u_dynamicpad_20260921/
+```
+
+该目录约 157 GiB，含完整的运行配置、`metrics.log`、TensorBoard event 以及
+step 250/500/750/1000 checkpoint。四个可直接评测的 `full_weights.pt` 均为
+10,884,602,673 bytes，SHA256 依次为：
+
+```text
+step250   46daea7f47365754fedb7289fdcf85f125a7305871ea98966d2a3a931b47317d
+step500   2dca18b9be6e43c360fb4709830a0210af0c3aee5ee468eabcbb6e3941862a86
+step750   79c334e054267b3f13712c1b3dd765066187121d56318a97dbcaaca24d068d23
+step1000  c156a73e7ab4333cf560daae99b580828050313890748c3fdc931e7a965f5700
+```
+
+### 18.2 fixed-seed target50 评测的当前结果
+
+协议均为 `split=pretrain`、base seed 7、5 trials/task、原生 MuJoCo readback，每个
+task 使用官方 horizon。当前已确认的状态如下：
+
+| policy | 目录 | 完整度 | successes | 可否报告 |
+| --- | --- | ---: | ---: | --- |
+| pretrained | `fixedseed-target50-pretrained-5trials-v7-20260922` | 50/50 tasks，250/250 episodes | 149/250 = 59.6% | 是 |
+| step500 v7 | `fixedseed-target50-step500-5trials-v7-20260922` | 18/50，90/250 | 74/90 | 否，仅是部分 |
+| step500 fill | `fixedseed-target50-step500-5trials-v8-fill-20260922` | 32/32，160/160 | 76/160 | 与 v7 合并 |
+| **step500 合并** | v7 + fill，任务交集为 0、并集为 50 | **50/50，250/250** | **150/250 = 60.0%** | **是** |
+| step1000 v7 | `fixedseed-target50-step1000-5trials-v7-20260922` | 19/50，95/250 | 82/95 | 否 |
+| step1000 fill | `fixedseed-target50-step1000-5trials-v8-fill-20260922` | 11/31，55/155 | 31/55 | 否，作业被取消 |
+| **step1000 当前合并** | v7 + fill，任务交集为 0 | **30/50，150/250** | **113/150 = 75.33%** | **否，不完整且任务子集有选择偏差** |
+
+step500 的 60.0% 是合并两个互不重叠任务集后的完整结果；它比同协议预训练
+59.6% 高 1/250 episode（0.4 个百分点），不应过度解读。step1000 的 75.33%
+是部分任务比例，不是 benchmark 分数。
+
+Slurm 终态：`108506 COMPLETED (0:0)`，`108507 FAILED (1:0)`，`108509 FAILED
+(1:0)`，`108586 COMPLETED (0:0)`，`108592 CANCELLED by 1892800073`。除 `108506` 外四个
+作业的结束时间分别为 2026-09-22 06:25:06、06:59:33、11:49:09 和 12:17:27。v7 在
+`gnho011` 上大量出现 `native-abort.json`；v8 fill 避开该节点后，step500 在
+`gnho008` 一次补齐。`108592` 也在 `gnho008` 正常产生 11 个 summary，但被外部
+取消；不应将它记为模型或 evaluator 失败。
+
+step1000 尚未评测的 20 个任务为：
+
+```text
+ArrangeBreadBasket,ArrangeTea,BreadSelection,CategorizeCondiments,
+CuttingToolSelection,GarnishPancake,GatherTableware,HeatKebabSandwich,
+MakeIceLemonade,PanTransfer,PortionHotDogs,RecycleBottlesByType,
+SearingMeat,SeparateFreezerRack,SteamInMicrowave,StirVegetables,
+StoreLeftoversInBowl,WaffleReheat,WashFruitColander,WeighIngredients
+```
+
+继续时应使用新的结果目录，只跑这 20 个任务；完成后与 step1000 v7 的 19 个和
+v8 fill 的 11 个 summary 合并，并再次确认三者 task 无交集、并集为 50、总计
+250 episodes，才能报告 step1000 分数。不要直接复用已有 v8 目录，以免残留
+scheduler/running 状态混入新作业。
+
+### 18.3 Git 不会保存的复刻资产
+
+主仓库 Git 只保存代码和本 handoff。下列内容受 `.gitignore` 影响或是独立 checkout，
+需要另外归档：
+
+1. **原始权重**：`checkpoints/Xiaomi-Robotics-1-RoboCasa365/`（约 9.5 GiB）。三个
+   safetensors shard 的 SHA256 为
+   `5c9412f2...cc53`、`72884ec9...f7d`、`5859c440...9cac`；必须同时保留
+   config、processor、tokenizer 和 remote-code Python 文件，不能只拷权重 shard。
+2. **PPO 训练产物**：最保险是整体保存上述 157-GiB 训练目录。只做推理/
+   评测时，至少保存四个 `actor/model_state_dict/full_weights.pt`、
+   `tensorboard/config.yaml`、`metrics.log` 和 Slurm 日志 `logs/xr1_rlinf_ppo_107949.log`。
+   要继续训练时还必须保存每个 step 的 `actor/dcp_checkpoint/` 及 `.metadata`；
+   `full_weights.pt` 本身不包含完整 optimizer/分布式恢复状态。
+3. **评测进度与证据**：保存 `eval_results/`（当前约 2.8 GiB）和对应
+   `logs/xr1_ppo_policy_eval_*.log`。最低限度是本节表中的五个目录，包含每任务
+   `summary.json`、`aggregate.json`、lane log 和 episode 视频。尤其不能丢失 step1000
+   v7/v8 已完成的 30 个 task，否则需重跑。
+4. **外部代码 checkout**：`third_party/RLinf` 必须保存/推送 commit
+   `6731138f91eefc089d00936c55052f4fa2dff215`；`third_party/robosuite` 是
+   `5ce6643f3092639d08f7b0f90ed1c6a84f50552c`；同级 `../robocasa` 是
+   `4f8a2980def75a55dff96b990745b83540425f09`。后者还含未跟踪的 `robocasa_v0.2/`
+   和 `.gitignore` 本地改动；若新机器也需要旧 v0.2 实验，必须单独归档。
+5. **RoboCasa assets 和环境**：保存 `../robocasa/robocasa/models/assets/`。可直接复制
+   `.conda-robocasa365/`（约 7.4 GiB），但跨机器更稳妥的方式是保存
+   `conda list --explicit -p .conda-robocasa365` 和 `.conda-robocasa365/bin/python -m pip freeze`
+   的输出，再重装三个固定 commit 的 editable package。当前关键版本是 Python 3.11、
+   torch 2.7.1、transformers 4.57.1、mujoco 3.3.1、numpy 2.2.5、ray 2.58.0。
+6. **集群配置**：异地运行前修改 sbatch 中硬编码的 `workspace_root`和
+   `#SBATCH --output`，保持 `yukaichenglab` 分区仅适用于当前集群。还需记录 GPU/CUDA
+   driver 和 EGL 运行时；评测必须保留 Slurm 的完整 job-local
+   `CUDA_VISIBLE_DEVICES`，model server 和 `MUJOCO_EGL_DEVICE_ID` 使用 lane ordinal。
+
+主模型三个 shard 的完整 SHA256 为：
+
+```text
+model-00001-of-00003.safetensors  5c9412f29facda098d5dcf1a58c06830edeeba7c0c59799480dd28b35c3fcc53
+model-00002-of-00003.safetensors  72884ec9b026794df9e3b5c1eb75341e503ae94f0e2555d1178157e3290b7f7d
+model-00003-of-00003.safetensors  5859c4408351a0b894c6175cf6f7a41e5e431637517a1d45587ad94f03d29cac
+```
+
+本快照的代码基线是主仓库 `f05382a` 及本文档后续提交。`results/`、
+`eval_results/`、`logs/`、`checkpoints/` 和外部 checkout 均不会因为 `git clone` 自动恢复。
