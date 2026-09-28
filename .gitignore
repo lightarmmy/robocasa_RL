@@ -168,6 +168,13 @@ coverage
 .secret
 wandb/
 hf_cache/
+
+# RLinf is vendored so this single repository contains the complete training
+# framework. Other local dependency checkouts and all model assets stay local.
+third_party/*
+!third_party/RLinf/
+!third_party/RLinf/**
+.hf_cache/
 ms_cache/
 om_cache/
 cache/

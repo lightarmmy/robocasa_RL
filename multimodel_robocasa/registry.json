@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "benchmark": "RoboCasa365",
+  "models": {
+    "xr1": {
+      "implementation": "xr1/mibot/rlinf",
+      "checkpoint": "checkpoints/Xiaomi-Robotics-1-RoboCasa365",
+      "algorithms": ["ppo", "grpo"],
+      "status": "trainable"
+    },
+    "pi05": {
+      "implementation": "third_party/openpi-g01-sft",
+      "checkpoint": "checkpoints/pytorch_pi05_base",
+      "algorithms": ["ppo", "grpo"],
+      "status": "requires_external_assets",
+      "requirements": [
+        "RoboCasa action normalization statistics"
+      ]
+    }
+  }
+}

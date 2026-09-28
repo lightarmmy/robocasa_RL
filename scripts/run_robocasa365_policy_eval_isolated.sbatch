@@ -22,10 +22,14 @@ policy_checkpoint=${POLICY_CHECKPOINT:-${repo_root}/results/xr1_ppo_full_stable_
 policy_name=${POLICY_NAME:-full_step100}
 eval_split=${EVAL_SPLIT:-pretrain}
 eval_seed=${EVAL_SEED:-7}
+seed_stride=${EVAL_SEED_STRIDE:-}
 num_trials=${NUM_TRIALS:-5}
 num_lanes=${NUM_LANES:-4}
+lane_offset=${EVAL_LANE_OFFSET:-0}
 min_successes=${EVAL_MIN_SUCCESSES:-0}
 eval_tasks=${EVAL_TASKS:-}
+direct_gl_readback=${EVAL_DIRECT_GL_READBACK:-0}
+save_videos=${EVAL_SAVE_VIDEOS:-1}
 result_root=${EVAL_RESULT_ROOT:-${repo_root}/eval_results/robocasa365-${policy_name}-${SLURM_JOB_ID}}
 # Multiple evaluation jobs may share one node. Give each Slurm job a disjoint
 # four-port block instead of colliding on the old fixed 12086..12089 range.
@@ -55,15 +59,27 @@ fi
   echo "NUM_LANES must be a positive integer, got: ${num_lanes}" >&2
   exit 2
 }
+[[ "${lane_offset}" =~ ^[0-9]+$ ]] || {
+  echo "EVAL_LANE_OFFSET must be a non-negative integer, got: ${lane_offset}" >&2
+  exit 2
+}
 [[ "${min_successes}" =~ ^[0-9]+$ ]] || {
   echo "EVAL_MIN_SUCCESSES must be a non-negative integer, got: ${min_successes}" >&2
   exit 2
 }
-if (( ${#allocated_gpus[@]} < num_lanes )); then
-  echo "Slurm allocated fewer GPU ids than NUM_LANES: ${slurm_gpu_allocation:-unset}" >&2
+[[ "${direct_gl_readback}" == "0" || "${direct_gl_readback}" == "1" ]] || {
+  echo "EVAL_DIRECT_GL_READBACK must be 0 or 1, got: ${direct_gl_readback}" >&2
+  exit 2
+}
+[[ "${save_videos}" == "0" || "${save_videos}" == "1" ]] || {
+  echo "EVAL_SAVE_VIDEOS must be 0 or 1, got: ${save_videos}" >&2
+  exit 2
+}
+if (( ${#allocated_gpus[@]} < lane_offset + num_lanes )); then
+  echo "Slurm allocated fewer GPU ids than EVAL_LANE_OFFSET + NUM_LANES: ${slurm_gpu_allocation:-unset}" >&2
   exit 2
 fi
-for gpu in "${allocated_gpus[@]:0:num_lanes}"; do
+for gpu in "${allocated_gpus[@]:lane_offset:num_lanes}"; do
   [[ "${gpu}" =~ ^[0-9]+$ ]] || {
     echo "Expected numeric Slurm GPU ids, got: ${slurm_gpu_allocation}" >&2
     exit 2
@@ -83,13 +99,16 @@ export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 echo "job=${SLURM_JOB_ID} host=$(hostname) policy_name=${policy_name}"
 echo "policy_checkpoint=${policy_checkpoint:-PRETRAINED_BASE_MODEL}"
 echo "result_root=${result_root} split=${eval_split} seed=${eval_seed} trials=${num_trials} lanes=${num_lanes}"
+echo "seed_stride=${seed_stride:-num_trials}"
 echo "min_successes=${min_successes}"
 echo "port_range=${port_base}-$((port_base + num_lanes - 1))"
 [[ -n "${eval_tasks}" ]] && echo "task_filter=${eval_tasks}"
-echo "slurm_gpu_allocation=${slurm_gpu_allocation}; physical_gpu_ids=${allocated_gpus[*]:0:num_lanes}"
-echo "job_cuda_visible_devices=${job_cuda_visible_devices}; model_devices=cuda:0-$((num_lanes - 1))"
+echo "slurm_gpu_allocation=${slurm_gpu_allocation}; selected_gpu_ids=${allocated_gpus[*]:lane_offset:num_lanes}"
+echo "job_cuda_visible_devices=${job_cuda_visible_devices}; model_devices=cuda:${lane_offset}-$((lane_offset + num_lanes - 1))"
 echo "mujoco_gl=${MUJOCO_GL}"
-NUM_LANES="${num_lanes}" "${python}" -c 'import os, torch, transformers; print("torch", torch.__version__, "transformers", transformers.__version__); assert torch.cuda.is_available() and torch.cuda.device_count() >= int(os.environ["NUM_LANES"])'
+echo "direct_gl_readback=${direct_gl_readback}"
+echo "save_videos=${save_videos}"
+REQUIRED_GPUS="$((lane_offset + num_lanes))" "${python}" -c 'import os, torch, transformers; print("torch", torch.__version__, "transformers", transformers.__version__); assert torch.cuda.is_available() and torch.cuda.device_count() >= int(os.environ["REQUIRED_GPUS"])'
 
 lane_pids=()
 cleanup() {
@@ -99,13 +118,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 for lane in $(seq 0 $((num_lanes - 1))); do
+  device_lane=$((lane_offset + lane))
   lane_log=${result_root}/lanes/lane-${lane}.log
   (
     set -uo pipefail
     export CUDA_VISIBLE_DEVICES=${job_cuda_visible_devices}
     if [[ "${MUJOCO_GL}" == "egl" ]]; then
       # Slurm exposes allocated devices as job-local ordinals 0..N-1.
-      export MUJOCO_EGL_DEVICE_ID=${lane}
+      export MUJOCO_EGL_DEVICE_ID=${device_lane}
     else
       unset MUJOCO_EGL_DEVICE_ID
     fi
@@ -140,7 +160,7 @@ PY
           --model "${model_path}"
           --host 127.0.0.1
           --port "${port}"
-          --device "cuda:${lane}"
+          --device "cuda:${device_lane}"
         )
         if [[ -n "${policy_checkpoint}" ]]; then
           server_args+=(--policy-checkpoint "${policy_checkpoint}")
@@ -160,12 +180,20 @@ PY
         task_status=1
         if (( ready )); then
           set +e
-          BASE_PORT=${port} NUM_TRIALS=${num_trials} SPLIT=${eval_split} SEED=${eval_seed} \
+          readback_arg=--no-direct-gl-readback
+          if [[ "${direct_gl_readback}" == "1" ]]; then
+            readback_arg=--direct-gl-readback
+          fi
+          video_args=()
+          if [[ "${save_videos}" == "1" ]]; then
+            video_args=(--save-videos --save-failure-videos)
+          fi
+          BASE_PORT=${port} NUM_TRIALS=${num_trials} SPLIT=${eval_split} SEED=${eval_seed} SEED_STRIDE=${seed_stride} \
             RUN_ID="${task_run}" PYTHON="${python}" \
             bash scripts/launch_robocasa365.sh \
               1 "${result_root}/results" "${model_path}" \
-              --task-name "${task}" --save-videos --save-failure-videos \
-              --no-direct-gl-readback \
+              --task-name "${task}" "${video_args[@]}" \
+              "${readback_arg}" \
               >"${task_log}" 2>&1
           task_status=$?
           set -e

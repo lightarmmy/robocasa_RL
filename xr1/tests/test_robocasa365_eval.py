@@ -2,16 +2,60 @@
 
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from deploy.server import Server
-from eval_robocasa365.entry import configure_direct_gl_readback, parse_args
+from eval_robocasa365.entry import (
+    configure_direct_gl_readback,
+    episode_index,
+    parse_args,
+    validate_args,
+)
 
 
 def test_direct_gl_readback_is_opt_in():
     assert parse_args([]).direct_gl_readback is False
+
+
+def test_seed_stride_keeps_short_screen_as_full_manifest_prefix():
+    short = parse_args(["--num-trials", "5", "--seed-stride", "20"])
+    full = parse_args(["--num-trials", "20", "--seed-stride", "20"])
+    validate_args(short)
+    validate_args(full)
+
+    for task_index in (0, 1, 17, 49):
+        assert [episode_index(short, task_index, episode) for episode in range(5)] == [
+            episode_index(full, task_index, episode) for episode in range(5)
+        ]
+
+
+def test_isolated_eval_exposes_explicit_readback_switch():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run_robocasa365_policy_eval_isolated.sbatch"
+    ).read_text()
+
+    assert "EVAL_DIRECT_GL_READBACK:-0" in script
+    assert "readback_arg=--no-direct-gl-readback" in script
+    assert "readback_arg=--direct-gl-readback" in script
+
+
+def test_step1000_gated_eval_keeps_gate_and_full_run_on_one_allocation():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run_step1000_remaining_eval_gated.sbatch"
+    ).read_text()
+
+    assert "#SBATCH --exclude=gnho011,gnho020" in script
+    assert "EVAL_TASKS=StoreLeftoversInBowl" in script
+    assert script.count("EVAL_DIRECT_GL_READBACK=0") == 2
+    assert "bash scripts/run_robocasa365_policy_eval_isolated.sbatch" in script
+    assert script.index("NATIVE_READBACK_GATE_PASSED") < script.index("POLICY_NAME=step1000_fill3")
 
 
 def test_server_preserves_explicit_job_local_device(monkeypatch):

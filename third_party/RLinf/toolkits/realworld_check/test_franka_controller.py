@@ -1,0 +1,132 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import argparse
+import json
+import os
+import time
+
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+from rlinf.robotics.parts.arms.franka_ros import FrankaROSArm
+from rlinf.robotics.parts.end_effectors import EndEffector
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Check Franka controller state.")
+    parser.add_argument(
+        "--robot-ip",
+        default=os.environ.get("FRANKA_ROBOT_IP", None),
+        help="Franka robot IP. Defaults to FRANKA_ROBOT_IP.",
+    )
+    parser.add_argument(
+        "--end-effector-type",
+        default="franka_gripper",
+        choices=sorted(EndEffector.backends()),
+        help="Mounted end-effector type.",
+    )
+    parser.add_argument(
+        "--hand-port",
+        default=None,
+        help="End-effector serial port, e.g. /dev/ttyUSB0.",
+    )
+    parser.add_argument(
+        "--hand-baudrate",
+        type=int,
+        default=None,
+        help="End-effector serial baudrate; defaults to the driver setting.",
+    )
+    parser.add_argument(
+        "--hand-motor-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="End-effector motor IDs; defaults to the driver setting.",
+    )
+    parser.add_argument(
+        "--end-effector-config",
+        type=json.loads,
+        default={},
+        help='Driver settings as a JSON object, e.g. {"port": "/dev/ttyUSB0"}.',
+    )
+    args = parser.parse_args()
+    if not isinstance(args.end_effector_config, dict):
+        parser.error("--end-effector-config must be a JSON object")
+    return args
+
+
+def main():
+    args = _parse_args()
+    robot_ip = args.robot_ip
+    assert robot_ip is not None, "Please set the FRANKA_ROBOT_IP environment variable."
+
+    end_effector_config = dict(args.end_effector_config)
+    for key, value in (
+        ("port", args.hand_port),
+        ("baudrate", args.hand_baudrate),
+        (
+            "motor_ids",
+            tuple(args.hand_motor_ids) if args.hand_motor_ids is not None else None,
+        ),
+    ):
+        if value is not None:
+            end_effector_config[key] = value
+
+    # The arm and the end effector open their own connections, so build and
+    # connect each one.
+    controller = FrankaROSArm(robot_ip=robot_ip, node_rank=0)
+    end_effector = EndEffector.of(
+        args.end_effector_type,
+        robot_ip=robot_ip,
+        node_rank=0,
+        **end_effector_config,
+    )
+    controller.connect()
+    end_effector.connect()
+
+    start_time = time.time()
+    while not controller.is_robot_up():
+        time.sleep(0.5)
+        if time.time() - start_time > 30:
+            print(
+                f"Waited {time.time() - start_time} seconds for Franka robot to be ready."
+            )
+    while True:
+        try:
+            cmd_str = input("Please input cmd:")
+            if cmd_str == "q":
+                break
+            elif cmd_str == "getpos":
+                print(controller.get_state().tcp_pose)
+            elif cmd_str == "getpos_euler":
+                tcp_pose = controller.get_state().tcp_pose
+                r = R.from_quat(tcp_pose[3:].copy())
+                euler = r.as_euler("xyz")
+                print(np.concatenate([tcp_pose[:3], euler]))
+            elif cmd_str == "getstate":
+                state = controller.get_state()
+                print(state.to_dict())
+            elif cmd_str == "gethand":
+                print(end_effector.get_observation())
+            else:
+                print(f"Unknown cmd: {cmd_str}")
+        except KeyboardInterrupt:
+            break
+        time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()

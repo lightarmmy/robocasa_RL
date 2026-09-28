@@ -46,8 +46,14 @@ REPLAN_STEPS="${REPLAN_STEPS:-16}"
 OBS_HISTORY="${OBS_HISTORY:-4}"
 OBS_INTERVAL="${OBS_INTERVAL:-2}"
 SEED="${SEED:-7}"
+SEED_STRIDE="${SEED_STRIDE:-}"
 CROP_RATIO="${CROP_RATIO:-0.95}"
 CAMERA_SAMPLING_INTERVAL="${CAMERA_SAMPLING_INTERVAL:-1}"
+
+seed_stride_args=()
+if [[ -n "${SEED_STRIDE}" ]]; then
+    seed_stride_args=(--seed-stride "${SEED_STRIDE}")
+fi
 
 "${PYTHON}" -u "${REPO_ROOT}/eval_robocasa365/dynamic_eval.py" init \
     --queue-dir "${QUEUE_DIR}" -- \
@@ -61,6 +67,7 @@ CAMERA_SAMPLING_INTERVAL="${CAMERA_SAMPLING_INTERVAL:-1}"
     --obs-history "${OBS_HISTORY}" \
     --obs-interval "${OBS_INTERVAL}" \
     --seed "${SEED}" \
+    "${seed_stride_args[@]}" \
     --crop-ratio "${CROP_RATIO}" \
     --camera-sampling-interval "${CAMERA_SAMPLING_INTERVAL}" \
     --save-root-dir "${LOG_PATH}" \

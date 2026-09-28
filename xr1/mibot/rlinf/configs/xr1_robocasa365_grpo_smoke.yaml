@@ -1,0 +1,14 @@
+defaults:
+  - xr1_robocasa365_grpo
+  - _self_
+
+runner:
+  max_steps: 1
+  save_interval: -1
+
+env:
+  train:
+    task_filter: [MakeIceLemonade]
+    max_episode_steps: 64
+    max_steps_per_rollout_epoch: 64
+

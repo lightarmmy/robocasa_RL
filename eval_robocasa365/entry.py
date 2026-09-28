@@ -355,6 +355,12 @@ def configure_direct_gl_readback(env: Any, enabled: bool) -> None:
     logging.info("DIRECT_GL_READBACK enabled=true")
 
 
+def episode_index(args: argparse.Namespace, task_index: int, episode: int) -> int:
+    """Return the stable global index used for both job IDs and episode seeds."""
+    stride = args.num_trials if args.seed_stride is None else args.seed_stride
+    return task_index * stride + episode
+
+
 def evaluate_task(
     env_name: str,
     task_index: int,
@@ -393,7 +399,7 @@ def evaluate_task(
     try:
         configure_camera_sampling_interval(env, args.camera_sampling_interval)
         for episode in tqdm(episodes, desc=env_name, disable=not show_progress):
-            global_episode_index = task_index * args.num_trials + episode
+            global_episode_index = episode_index(args, task_index, episode)
             episode_seed = args.seed + global_episode_index
             logging.info(
                 "EPISODE_START task=%s episode=%d global=%d seed=%d horizon=%d",
@@ -501,6 +507,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--obs-interval", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--seed-stride",
+        type=int,
+        default=None,
+        help=(
+            "Per-task seed block width. Defaults to num-trials for backward "
+            "compatibility; set it to the full benchmark trial count so a "
+            "short screen is an exact prefix of the full seed manifest."
+        ),
+    )
     parser.add_argument("--crop-ratio", type=float, default=0.95)
     parser.add_argument("--save-root-dir", default="eval_results/robocasa365")
     parser.add_argument("--run-id", default=None)
@@ -518,6 +534,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-tasks must be at least 1")
     if args.num_trials < 1:
         raise ValueError("--num-trials must be at least 1")
+    if args.seed_stride is not None and args.seed_stride < args.num_trials:
+        raise ValueError("--seed-stride must be at least --num-trials")
     if args.replan_steps < 1:
         raise ValueError("--replan-steps must be at least 1")
     if args.obs_history < 1 or args.obs_interval < 1:

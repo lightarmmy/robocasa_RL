@@ -68,7 +68,7 @@ def initialize_queue(queue_dir: Path, evaluation_args: list[str]) -> None:
     for env_name in selected_tasks:
         task_index = task_to_index[env_name]
         for episode in range(args.num_trials):
-            global_episode_index = task_index * args.num_trials + episode
+            global_episode_index = entry.episode_index(args, task_index, episode)
             job = {
                 "id": f"{global_episode_index:08d}",
                 "env_name": env_name,

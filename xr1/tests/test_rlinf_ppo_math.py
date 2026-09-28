@@ -73,6 +73,57 @@ def test_embodied_gae_and_actor_critic_loss_backpropagate():
     assert float(current_values.grad.abs().sum()) > 0.0
 
 
+def test_embodied_grpo_group_advantages_and_actor_loss_backpropagate():
+    steps, group_size, chunks, action_dim = 2, 2, 1, 4
+    rewards = torch.zeros(steps, group_size, chunks)
+    rewards[-1, 1] = 1.0
+    dones = torch.zeros(steps + 1, group_size, chunks, dtype=torch.bool)
+    dones[-1] = True
+    rollout_mask = torch.ones(steps, group_size, chunks, dtype=torch.bool)
+
+    result = calculate_adv_and_returns(
+        task_type="embodied",
+        adv_type="grpo",
+        rewards=rewards,
+        dones=dones,
+        values=None,
+        num_action_chunks=chunks,
+        gamma=0.99,
+        gae_lambda=0.95,
+        group_size=group_size,
+        reward_type="chunk_level",
+        loss_mask=rollout_mask,
+        normalize_advantages=False,
+    )
+    advantages = result["advantages"]
+    assert advantages.shape == (steps, group_size, chunks)
+    assert torch.all(advantages[:, 0] < 0)
+    assert torch.all(advantages[:, 1] > 0)
+
+    logprobs = torch.zeros(steps * group_size, action_dim, requires_grad=True)
+    old_logprobs = logprobs.detach().clone()
+    loss, metrics = policy_loss(
+        loss_type="actor",
+        task_type="embodied",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=action_dim,
+        logprobs=logprobs,
+        old_logprobs=old_logprobs,
+        advantages=advantages,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        loss_mask=rollout_mask,
+        max_episode_steps=steps,
+        critic_warmup=False,
+    )
+    assert metrics
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert logprobs.grad is not None and torch.isfinite(logprobs.grad).all()
+    assert float(logprobs.grad.abs().sum()) > 0.0
+
+
 def test_worker_restart_is_truncation_not_success():
     terminations, truncations = classify_robocasa365_step_boundaries(
         successes=np.array([False, True, False]),

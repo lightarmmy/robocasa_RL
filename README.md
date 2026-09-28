@@ -1,3 +1,19 @@
+# RoboCasa RL: multi-model PPO/GRPO platform
+
+This repository vendors the customized RLinf training framework together with
+the XR-1 adapter, RoboCasa365 evaluation stack, and initial PPO/GRPO platform
+configuration for XR-1 and pi0.5. FastWAM and DreamZero adapters are planned.
+
+Start with [`multimodel_robocasa/README.md`](multimodel_robocasa/README.md) for
+the shared model contract, current support matrix, resource preflight, and
+training commands. Model checkpoints, normalization statistics, simulator
+assets, results, and videos are intentionally excluded from Git.
+
+The remainder of this document is the upstream Xiaomi-Robotics-1 documentation
+retained for model setup and evaluation reference.
+
+---
+
 <div align="center">
 
   # Xiaomi-Robotics-1

@@ -1,0 +1,36 @@
+defaults:
+  - pi05_robocasa365_ppo
+  - _self_
+
+runner:
+  logger:
+    experiment_name: pi05_robocasa365_grpo
+
+algorithm:
+  normalize_advantages: false
+  group_size: ${oc.decode:${oc.env:PI05_RLINF_GROUP_SIZE,2}}
+  adv_type: grpo
+  loss_type: actor
+  filter_rewards: true
+  rewards_lower_bound: 0.01
+  rewards_upper_bound: 0.99
+
+env:
+  train:
+    total_num_envs: ${algorithm.group_size}
+    group_size: ${algorithm.group_size}
+    seed_strategy: same
+    rotate_tasks_on_rollout: true
+    rotate_tasks_on_auto_reset: false
+    ignore_terminations: true
+    max_steps_per_rollout_epoch: 768
+
+rollout:
+  collect_final_values: false
+
+actor:
+  global_batch_size: ${algorithm.group_size}
+  model:
+    add_value_head: false
+    openpi:
+      add_value_head: false
